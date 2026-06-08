@@ -1,0 +1,20 @@
+========================================================
+1C AUTHORIZATOR - INSTALLATION AND SETUP INSTRUCTIONS
+========================================================
+
+Step 1. Automatic Installation
+1. Move/extract this folder (1C_Authorizator_Ready) to any temporary location.
+2. Right-click on `install.bat` and select "Run as administrator".
+3. This will install the application to `C:\Across\1C Authorizator` with appropriate file permissions, and register a Scheduled Task (starts on Windows logon with a 1-minute delay).
+
+Step 2. How to Use
+- The application will launch automatically 1 minute after Windows logon.
+- It displays a sleek modern window saying "Отсканируйте бейдж для входа".
+- Show your QR code to the scanner. The application will log you in, launch 1C, and hide itself to the Windows System Tray.
+- To log in again (or under a different user), double-click the 1C Authorizator tray icon to show the login window.
+- Right-click the tray icon and select "Exit" to close the application.
+
+Troubleshooting & Logs:
+- Program logs are located in: `C:\Across\1C Authorizator\1c-authorizator.log`
+- Verbose debug logs (if debug is enabled in config.yaml) are in: `C:\Across\1C Authorizator\1c-auth-debug.log`
+- Task Scheduler configuration XML is in: `C:\Across\1C Authorizator\1c_auth_task.xml`
