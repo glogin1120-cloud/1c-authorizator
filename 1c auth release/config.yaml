@@ -1,0 +1,26 @@
+# Конфигурация 1C Authorizator
+
+# Настройки 1С
+# Дефолтный путь "C:\\Program Files (x86)\\1cv8\\8.3.27.1786\\bin\\1cv8.exe"
+pathTo1c: "C:\\Program Files (x86)\\1cv8\\8.3.27.1786\\bin\\1cv8.exe"
+platformVersion: "8.3"
+defaultServer: "10.216.51.1"
+defaultDatabase: "acl20v8_pao"
+
+# Настройки сканера
+scanner:
+  prefix: "QR:"          # Префикс сканера (например, "QR:" или "~")
+  timeout_ms: 1000   # Таймаут между символами в мс
+  minBarcodeLen: 5       # Минимальная длина шк
+
+# Поведение приложения
+logFile: "1c-authorizator.log"
+# Рестарт 1С
+restart1C: true
+# Режим отладки (вывод логов перехвата клавиш)
+debug: false
+
+# Поведение окна
+topMost: false          # Отображать окно поверх всех остальных окон (true/false)
+theme: auto             # Тема оформления: auto (системная), dark (темная), light (светлая)
+appVersion: "1.0.0"     # Версия приложения

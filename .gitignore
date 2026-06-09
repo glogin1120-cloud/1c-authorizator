@@ -17,3 +17,8 @@ obj/
 # OS
 Thumbs.db
 Desktop.ini
+
+# Allow release files
+!1c auth release/*.exe
+!1c auth release/*.ico
+

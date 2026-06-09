@@ -8,6 +8,7 @@ using System.IO;
 using System.Text;
 using System.Threading;
 using System.Collections.Generic;
+using System.Collections.Concurrent;
 
 [assembly: System.Reflection.AssemblyVersion("1.0.0")]
 [assembly: System.Reflection.AssemblyFileVersion("1.0.0")]
@@ -17,7 +18,16 @@ using System.Collections.Generic;
 
 public class Program
 {
-    public const string Version = "1.0.0";
+    // Application version is taken from config (config.yaml); throws if missing
+    public static string Version
+    {
+        get
+        {
+            if (LoginFormInstance._config != null && !string.IsNullOrEmpty(LoginFormInstance._config.appVersion))
+                return LoginFormInstance._config.appVersion;
+            throw new Exception("Не задана версия приложения (appVersion) в конфигурации!");
+        }
+    }
     public static LoginForm FormInstance;
 
     [STAThread]
@@ -74,7 +84,7 @@ public class LoginFormInstance
     private static DateTime _lastKeyPressTime = DateTime.MinValue;
     
     // Config
-    private static Config _config;
+    public static AppConfig _config;
     
     // Threads & Sync
     private static Queue<string> _scanQueue = new Queue<string>();
@@ -160,17 +170,17 @@ public class LoginFormInstance
                 exeDir = Path.GetFullPath(Path.Combine(exeDir, ".."));
                 configPath = Path.Combine(exeDir, "config.yaml");
             }
-            _config = Config.Load(configPath);
-        // Ensure version is set; fallback to compiled constant if missing
-        if (string.IsNullOrEmpty(_config.appVersion))
-        {
-            _config.appVersion = Program.Version;
-            Log("Config missing appVersion; using default constant: " + Program.Version);
-        }
+            _config = AppConfig.Load(configPath);
+            // Ensure version is set; if missing, set to "unknown"
+            if (string.IsNullOrEmpty(_config.appVersion))
+            {
+                _config.appVersion = "unknown";
+                Log("Config missing appVersion; defaulting to \"unknown\"");
+            }
         }
         catch (Exception ex)
         {
-            _config = new Config();
+            _config = new AppConfig();
             Log("Error loading config, using defaults: " + ex.Message);
         }
     }
@@ -215,6 +225,10 @@ public class LoginFormInstance
         return '\0';
     }
 
+    // [MODIFICATION] Метод MapChar удален, так как хук низкого уровня теперь напрямую маппит виртуальные коды клавиш (vkCode) в
+    // ASCII-символы раскладки US QWERTY (в методе VkCodeToChar), что исключает зависимость от текущей раскладки Windows и предотвращает
+    // искажение символов Base32 (например, превращение 'Y' в кириллическую 'Н' и затем ошибочный маппинг в 'H').
+
     private static IntPtr HookCallback(int nCode, IntPtr wParam, IntPtr lParam)
     {
         try
@@ -223,6 +237,10 @@ public class LoginFormInstance
             if (nCode >= 0 && (wParam == (IntPtr)WM_KEYDOWN || wParam == (IntPtr)WM_SYSKEYDOWN))
             {
                 int vkCode = Marshal.ReadInt32(lParam);
+                // Filter out modifier keys (Shift, Ctrl, Alt) to avoid capturing them as '?' characters
+                if (vkCode == 0xA0 || vkCode == 0xA1 || vkCode == 0xA2 || vkCode == 0xA3) {
+                    return CallNextHookEx(_hookID, nCode, wParam, lParam);
+                }
                 bool shift = IsShiftPressed();
                 char c = VkCodeToChar((uint)vkCode, shift);
 
@@ -269,6 +287,10 @@ public class LoginFormInstance
                             _capturing = true;
                             _capturedBuffer.Length = 0; // Clear buffer to store the actual data
                             Program.FormInstance.UpdateStatus("Считывание QR-кода...", "Info");
+                            // [MODIFICATION] Вызов ShowQrNotification временно отключен в потоке хука клавиатуры,
+                            // так как ShowBalloonTip блокирует поток хука на время обращения к Explorer.exe. При быстром
+                            // вводе со сканера это приводило к тайм-ауту хука и потере Windows 25-30 символов.
+                            // if (Program.FormInstance != null) Program.FormInstance.ShowQrNotification();
                             return (IntPtr)1; // Block the prefix ending key (e.g. ':')
                         }
 
@@ -335,14 +357,20 @@ public class LoginFormInstance
         string text = _capturedBuffer.ToString();
         _capturedBuffer.Length = 0;
 
-        if (!string.IsNullOrEmpty(text))
+        if (!string.IsNullOrEmpty(text) && text.Length >= _config.minBarcodeLen)
         {
             lock (_queueLock)
             {
                 _scanQueue.Enqueue(_config.scannerPrefix + text);
             }
             _queueSignal.Set();
+            Log(string.Format("Capture enqueued (len={0})", text.Length));
         }
+        else if (!string.IsNullOrEmpty(text))
+        {
+            Log(string.Format("Capture discarded due to insufficient length ({0} < {1})", text.Length, _config.minBarcodeLen));
+        }
+
     }
 
     public static void ResetHookState()
@@ -389,30 +417,22 @@ public class LoginFormInstance
 
             LogDebug("Raw base32 part: " + base32Part);
 
-            // Translate Shift-desynchronized characters back to Base32 digits and clean padding
+            // [MODIFICATION] Прямая фильтрация символов Base32. Поскольку раскладка клавиатуры теперь не влияет на символы (благодаря прямому маппингу vkCode),
+            // нам не требуется сложная логика трансляции раскладок. Мы просто фильтруем входящую строку, оставляя только валидные символы Base32 (A-Z, 2-7) и '='.
+            // Это также автоматически игнорирует спец-символы-разделители (такие как '0'), которые некоторые сканеры вставляют между повторяющимися клавишами.
             StringBuilder cleanedSb = new StringBuilder();
             foreach (char ch in base32Part)
             {
-                char mapped = ch;
-                switch (ch)
+                char upperCh = char.ToUpperInvariant(ch);
+                if ((upperCh >= 'A' && upperCh <= 'Z') || (upperCh >= '2' && upperCh <= '7') || upperCh == '=')
                 {
-                    case '"': mapped = '2'; break;
-                    case '№': mapped = '3'; break;
-                    case ';': mapped = '4'; break;
-                    case '%': mapped = '5'; break;
-                    case ':': mapped = '6'; break;
-                    case '?': mapped = '7'; break;
-                }
-                
-                // Skip '0' (duplicated padding) and '=' (Base32 padding)
-                if (mapped != '0' && mapped != '=')
-                {
-                    cleanedSb.Append(mapped);
+                    cleanedSb.Append(upperCh);
                 }
             }
             string cleanedBase32 = cleanedSb.ToString();
             LogDebug("Cleaned base32 part: " + cleanedBase32);
             Log(cleanedBase32);
+// Padding logic removed; proceeding without automatic padding.
 
             // Decode Base32
             byte[] jsonDataBytes;
@@ -499,7 +519,7 @@ public class LoginFormInstance
         }
     }
 
-    private static string Build1CArgs(User u, Config c)
+    private static string Build1CArgs(User u, AppConfig c)
     {
         StringBuilder sb = new StringBuilder();
         sb.Append("ENTERPRISE ");
@@ -530,15 +550,58 @@ public class LoginFormInstance
         return sb.ToString().Trim();
     }
 
+    // [MODIFICATION] Перевод логирования в асинхронный режим для предотвращения зависания WH_KEYBOARD_LL и пропусков ввода со сканера.
     private static readonly object _logLock = new object();
-
-    public static void Log(string message)
-
+    private struct LogEntry
     {
-        string logPath = _config != null ? _config.logFile : "1c-authorizator.log";
-        string timestamp = DateTime.Now.ToString("yyyy'/'MM'/'dd HH:mm:ss");
-        string logLine = string.Format("{0} {1}", timestamp, message);
+        public string Path;
+        public string Message;
+    }
+    private static ConcurrentQueue<LogEntry> _logQueue = new ConcurrentQueue<LogEntry>();
+    private static Thread _logWorkerThread;
+    private static bool _logWorkerRunning = false;
 
+    private static void StartLogWorkerIfNeeded()
+    {
+        if (_logWorkerRunning) return;
+        lock (_logLock)
+        {
+            if (_logWorkerRunning) return;
+            _logWorkerRunning = true;
+            _logWorkerThread = new Thread(LogWorkerLoop);
+            _logWorkerThread.IsBackground = true;
+            _logWorkerThread.Start();
+        }
+    }
+
+    private static void LogWorkerLoop()
+    {
+        while (true)
+        {
+            if (_logQueue.Count > 0)
+            {
+                var groupedLogs = new Dictionary<string, StringBuilder>();
+                LogEntry entry;
+                while (_logQueue.TryDequeue(out entry))
+                {
+                    if (!groupedLogs.ContainsKey(entry.Path))
+                    {
+                        groupedLogs[entry.Path] = new StringBuilder();
+                    }
+                    groupedLogs[entry.Path].AppendLine(entry.Message);
+                }
+
+                foreach (var kvp in groupedLogs)
+                {
+                    WriteLogToFile(kvp.Key, kvp.Value.ToString());
+                }
+            }
+            Thread.Sleep(100);
+        }
+    }
+
+    private static void WriteLogToFile(string logPath, string text)
+    {
         try
         {
             if (!Path.IsPathRooted(logPath))
@@ -555,44 +618,42 @@ public class LoginFormInstance
 
             lock (_logLock)
             {
-                File.AppendAllText(logPath, logLine + Environment.NewLine, Encoding.UTF8);
+                File.AppendAllText(logPath, text, Encoding.UTF8);
             }
         }
         catch
         {
-            // Fallback to local directory if configured path fails (e.g. permission issues)
             try
             {
                 string exeDir = Path.GetDirectoryName(System.Reflection.Assembly.GetExecutingAssembly().Location);
                 string fallbackPath = Path.Combine(exeDir, "1c-authorizator.log");
                 lock (_logLock)
                 {
-                    File.AppendAllText(fallbackPath, "[FALLBACK] " + logLine + Environment.NewLine, Encoding.UTF8);
+                    File.AppendAllText(fallbackPath, "[FALLBACK] " + text, Encoding.UTF8);
                 }
             }
-            catch {}
+            catch { }
         }
     }
 
+    public static void Log(string message)
+    {
+        StartLogWorkerIfNeeded();
+        string logPath = _config != null ? _config.logFile : "1c-authorizator.log";
+        string timestamp = DateTime.Now.ToString("yyyy'/'MM'/'dd HH:mm:ss");
+        string logLine = string.Format("{0} {1}", timestamp, message);
+        _logQueue.Enqueue(new LogEntry { Path = logPath, Message = logLine });
+    }
 
     public static void LogDebug(string message)
     {
         if (_config != null && _config.debug)
         {
-            try
-            {
-                string exeDir = Path.GetDirectoryName(System.Reflection.Assembly.GetExecutingAssembly().Location);
-                string debugLogPath = Path.Combine(exeDir, "1c-auth-debug.log");
-                
-                string timestamp = DateTime.Now.ToString("yyyy'/'MM'/'dd HH:mm:ss");
-                string logLine = string.Format("{0} [DEBUG] {1}", timestamp, message);
-
-                lock (_logLock)
-                {
-                    File.AppendAllText(debugLogPath, logLine + Environment.NewLine, Encoding.UTF8);
-                }
-            }
-            catch {}
+            StartLogWorkerIfNeeded();
+            string debugLogPath = "1c-auth-debug.log";
+            string timestamp = DateTime.Now.ToString("yyyy'/'MM'/'dd HH:mm:ss");
+            string logLine = string.Format("{0} [DEBUG] {1}", timestamp, message);
+            _logQueue.Enqueue(new LogEntry { Path = debugLogPath, Message = logLine });
         }
     }
 
@@ -635,7 +696,7 @@ public class LoginFormInstance
 
 public class LoginForm : Form
 {
-    private Config _config;
+    private AppConfig _config;
     private NotifyIcon _notifyIcon;
     private ContextMenu _trayMenu;
 
@@ -647,6 +708,12 @@ public class LoginForm : Form
     private Label _closeButton;
     private Label _minimizeButton;
     private TextBox _barcodeTextBox;
+
+    // [MODIFICATION] Метод отключен, так как вызов ShowBalloonTip блокирует поток клавиатурного хука и приводит к потере символов.
+    public void ShowQrNotification()
+    {
+        // Отключено во избежание LowLevelHooksTimeout
+    }
 
 
     // Theme state and colors
@@ -703,7 +770,7 @@ public class LoginForm : Form
         }
     }
 
-    public LoginForm(Config config)
+    public LoginForm(AppConfig config)
     {
         _config = config;
 
@@ -1364,85 +1431,4 @@ public class User
     }
 }
 
-public class Config
-{
-    public string pathTo1c = @"C:\Program Files (x86)\1cv8\8.3.27.1786\bin\1cv8.exe";
-    public string platformVersion = "8.3";
-    public string defaultServer = "";
-    public string defaultDatabase = "";
-    public string scannerPrefix = "QR:";
-    public int scannerTimeoutMs = 1000;
 
-    public int minBarcodeLen = 5;
-    public string logFile = "1c-authorizator.log";
-    public bool restart1C = true;
-    public bool debug = false;
-    public bool topMost = false;
-    public string theme = "auto";
-    public string appVersion = "1.0.0";
-
-
-    public static Config Load(string path)
-    {
-        Config c = new Config();
-        if (!File.Exists(path)) return c;
-
-        string[] lines = File.ReadAllLines(path);
-        string currentSection = "";
-
-        foreach (string line in lines)
-        {
-            string trimmed = line.Trim();
-            if (string.IsNullOrEmpty(trimmed) || trimmed.StartsWith("#")) continue;
-
-            // Reset section if the line is not indented (root-level key)
-            bool isIndented = line.StartsWith(" ") || line.StartsWith("\t");
-            if (!isIndented)
-            {
-                currentSection = "";
-            }
-
-            if (trimmed.EndsWith(":") && !trimmed.Contains("\""))
-            {
-                currentSection = trimmed.Substring(0, trimmed.Length - 1).Trim().ToLower();
-                continue;
-            }
-
-            int colonIdx = trimmed.IndexOf(':');
-            if (colonIdx < 0) continue;
-
-            string key = trimmed.Substring(0, colonIdx).Trim().ToLower();
-            string val = trimmed.Substring(colonIdx + 1).Trim();
-
-            int hashIdx = val.IndexOf('#');
-            if (hashIdx >= 0) val = val.Substring(0, hashIdx).Trim();
-
-            if (val.StartsWith("\"") && val.EndsWith("\"") && val.Length >= 2)
-                val = val.Substring(1, val.Length - 2);
-            else if (val.StartsWith("'") && val.EndsWith("'") && val.Length >= 2)
-                val = val.Substring(1, val.Length - 2);
-
-            if (currentSection == "scanner")
-            {
-                if (key == "prefix") c.scannerPrefix = val;
-                else if (key == "timeout_ms") int.TryParse(val, out c.scannerTimeoutMs);
-                else if (key == "minbarcodelen") int.TryParse(val, out c.minBarcodeLen);
-            }
-            else
-            {
-                if (key == "pathto1c") c.pathTo1c = val;
-                else if (key == "platformversion") c.platformVersion = val;
-                else if (key == "defaultserver") c.defaultServer = val;
-                else if (key == "defaultdatabase") c.defaultDatabase = val;
-                else if (key == "logfile") c.logFile = val;
-                else if (key == "restart1c") c.restart1C = val.ToLower() == "true" || val == "1";
-                else if (key == "debug") c.debug = val.ToLower() == "true" || val == "1";
-                else if (key == "topmost") c.topMost = val.ToLower() == "true" || val == "1";
-                else if (key == "theme") c.theme = val.ToLower();
-                else if (key == "appversion") c.appVersion = val;
-            }
-
-        }
-        return c;
-    }
-}
